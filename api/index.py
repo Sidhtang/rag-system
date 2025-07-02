@@ -24,6 +24,10 @@ from io import BytesIO
 import asyncpg
 import asyncio
 import logging
+import pinecone
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,8 +36,8 @@ logger = logging.getLogger(__name__)
 # Create FastAPI app
 app = FastAPI(
     title="Policy Reviewer API",
-    description="API for analyzing policy documents using Gemini AI with chat history support",
-    version="1.0.0"
+    description="API for analyzing policy documents using Gemini AI with chat history support and RAG capabilities",
+    version="2.0.0"
 )
 
 # Add CORS middleware to allow cross-origin requests
@@ -45,8 +49,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Read API key from environment variables (for Vercel deployment)
+# Read API key from environment variables
 DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
+PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT", "")
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "policy-documents")
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -54,10 +61,48 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 # Database connection pool
 db_pool = None
 
-# Document storage using an in-memory dictionary instead of files
-document_cache = {}
+# Document storage using enhanced cache
+class DocumentCache:
+    def __init__(self, max_size=1000):
+        self.cache = {}
+        self.access_times = {}
+        self.max_size = max_size
 
-# Chat history storage (in production, this should be in database)
+    def get(self, key):
+        if key in self.cache:
+            self.access_times[key] = time.time()
+            return self.cache[key]
+        return None
+
+    def set(self, key, value):
+        if len(self.cache) >= self.max_size:
+            # Remove oldest accessed item
+            oldest_key = min(self.access_times.keys(), key=lambda k: self.access_times[k])
+            del self.cache[oldest_key]
+            del self.access_times[oldest_key]
+
+        self.cache[key] = value
+        self.access_times[key] = time.time()
+
+    def clear_old_entries(self, max_age_hours=24):
+        """Clear entries older than max_age_hours"""
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+
+        old_keys = [
+            key for key, access_time in self.access_times.items()
+            if current_time - access_time > max_age_seconds
+        ]
+
+        for key in old_keys:
+            if key in self.cache:
+                del self.cache[key]
+            if key in self.access_times:
+                del self.access_times[key]
+
+enhanced_document_cache = DocumentCache(max_size=1000)
+
+# Chat history storage
 chat_history_cache = {}
 
 # Track analysis progress
@@ -69,18 +114,140 @@ thread_pool = ThreadPoolExecutor(max_workers=8)
 # Create a session with connection pooling
 session = requests.Session()
 retry_strategy = Retry(
-    total=2,  # Reduced retries
-    backoff_factor=0.5,  # Faster backoff
+    total=2,
+    backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
 )
 adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# Add this to your imports
-from rag_pipeline import RAGPipeline
+# Initialize embedding model (lazy loaded)
+embedding_model = None
 
-# Initialize RAG pipeline with your FastAPI app
+def get_embedding_model():
+    """Lazy load embedding model to save memory"""
+    global embedding_model
+    if embedding_model is None:
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # Small, fast model
+    return embedding_model
+
+# Initialize Pinecone
+pinecone_index = None
+
+def init_pinecone():
+    """Initialize Pinecone connection"""
+    global pinecone_index
+    if PINECONE_API_KEY and not pinecone_index:
+        try:
+            pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+            pinecone_index = pinecone.Index(PINECONE_INDEX_NAME)
+            logger.info("Pinecone initialized successfully")
+        except Exception as e:
+            logger.error(f"Pinecone initialization failed: {str(e)}")
+
+# RAG Pipeline class
+class RAGPipeline:
+    def __init__(self):
+        self.model = None
+
+    async def process_text(self, text, metadata):
+        """Process text and create embeddings for RAG"""
+        try:
+            # Create chunks
+            chunks = smart_chunk_for_rag(text)
+
+            # Generate embeddings for chunks
+            model = get_embedding_model()
+            embeddings_data = []
+            collection_name = f"policy_{metadata['sector'].lower()}_{int(time.time())}"
+
+            for i, chunk in enumerate(chunks):
+                embedding = model.encode(chunk['text'])
+
+                chunk_id = f"{collection_name}_chunk_{i}"
+                chunk_data = {
+                    'id': chunk_id,
+                    'values': embedding.tolist(),
+                    'metadata': {
+                        'collection': collection_name,
+                        'chunk_index': i,
+                        'text': chunk['text'],
+                        'length': chunk['length'],
+                        **metadata
+                    }
+                }
+                embeddings_data.append(chunk_data)
+
+            # Store in Pinecone
+            if pinecone_index:
+                pinecone_index.upsert(vectors=embeddings_data, namespace=collection_name)
+
+            # Store summary embedding for quick document retrieval
+            summary = text[:2000]  # First 2000 chars as summary
+            summary_embedding = model.encode(summary)
+
+            summary_data = {
+                'id': f"{collection_name}_summary",
+                'values': summary_embedding.tolist(),
+                'metadata': {
+                    'collection': collection_name,
+                    'type': 'summary',
+                    'text': summary,
+                    **metadata
+                }
+            }
+
+            if pinecone_index:
+                pinecone_index.upsert(vectors=[summary_data], namespace=collection_name)
+
+            return collection_name
+
+        except Exception as e:
+            logger.error(f"Error processing document embeddings: {str(e)}")
+            return None
+
+    async def retrieve_relevant_chunks(self, query, collection_name, top_k=5):
+        """Retrieve relevant chunks using RAG"""
+        try:
+            if not pinecone_index:
+                return []
+
+            # Generate query embedding
+            model = get_embedding_model()
+            query_embedding = model.encode(query)
+
+            # Search in Pinecone
+            results = pinecone_index.query(
+                vector=query_embedding.tolist(),
+                top_k=top_k,
+                namespace=collection_name,
+                include_metadata=True
+            )
+
+            relevant_chunks = []
+            for match in results['matches']:
+                relevant_chunks.append({
+                    'text': match['metadata']['text'],
+                    'score': match['score'],
+                    'document_id': match['metadata'].get('document_id', 'unknown'),
+                    'chunk_index': match['metadata'].get('chunk_index', 0)
+                })
+
+            return relevant_chunks
+
+        except Exception as e:
+            logger.error(f"Error retrieving relevant chunks: {str(e)}")
+            return []
+
+    def get_context_string(self, relevant_chunks):
+        """Format relevant chunks into a context string"""
+        context_parts = []
+        for chunk in relevant_chunks:
+            context_parts.append(f"[Score: {chunk['score']:.3f}] {chunk['text']}")
+        return "\n\n".join(context_parts)
+
+# Initialize RAG pipeline
 rag_pipeline = RAGPipeline()
 
 def get_api_key(api_key: Optional[str] = None):
@@ -175,7 +342,7 @@ def direct_api_call_optimized(prompt, api_key, max_retries=2):
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
-        response = session.post(url, json=payload, headers=headers, timeout=45)  # Reduced timeout
+        response = session.post(url, json=payload, headers=headers, timeout=45)
 
         if response.status_code == 200:
             result = response.json()
@@ -296,7 +463,7 @@ def extract_text_from_pdf_fast(pdf_bytes):
 
                     if page_text and page_text.strip():
                         cleaned_text = ' '.join(page_text.split())
-                        text_parts.append(cleaned_text)  # Remove page headers for speed
+                        text_parts.append(cleaned_text)
 
                 except Exception as e:
                     logger.warning(f"Error on page {page_num + 1}: {str(e)}")
@@ -377,6 +544,42 @@ def smart_chunk_text(text, max_chunk_size=150000):
 
     return chunks
 
+def smart_chunk_for_rag(text, chunk_size=1000, overlap=100):
+    """Create overlapping chunks optimized for RAG"""
+    sentences = text.split('. ')
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for sentence in sentences:
+        sentence_length = len(sentence)
+
+        if current_length + sentence_length > chunk_size and current_chunk:
+            chunk_text = '. '.join(current_chunk) + '.'
+            chunks.append({
+                'text': chunk_text,
+                'length': len(chunk_text),
+                'sentences': len(current_chunk)
+            })
+
+            # Keep overlap sentences
+            overlap_sentences = current_chunk[-2:] if len(current_chunk) > 2 else current_chunk
+            current_chunk = overlap_sentences + [sentence]
+            current_length = sum(len(s) for s in current_chunk)
+        else:
+            current_chunk.append(sentence)
+            current_length += sentence_length
+
+    if current_chunk:
+        chunk_text = '. '.join(current_chunk) + '.'
+        chunks.append({
+            'text': chunk_text,
+            'length': len(chunk_text),
+            'sentences': len(current_chunk)
+        })
+
+    return chunks
+
 def download_and_process_single_url(url, api_key):
     """Process single URL in thread"""
     try:
@@ -423,7 +626,7 @@ async def process_urls_parallel(storj_urls, api_key):
 
 def make_gemini_api_call(prompt, api_key):
     """Thread-safe Gemini API call"""
-    return direct_api_call_optimized(prompt, api_key, max_retries=2)  # Reduce retries
+    return direct_api_call_optimized(prompt, api_key, max_retries=2)
 
 async def analyze_chunks_parallel(chunks, prompt_context, api_key):
     """Analyze chunks in parallel"""
@@ -562,6 +765,17 @@ async def init_db():
                         metadata JSONB DEFAULT '{}',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS rag_embeddings (
+                        id SERIAL PRIMARY KEY,
+                        document_id VARCHAR(255) NOT NULL,
+                        chunk_id VARCHAR(255) NOT NULL,
+                        embedding_vector vector(384),
+                        metadata JSONB NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(document_id, chunk_id)
                     )
                 """)
         except Exception as e:
@@ -804,10 +1018,229 @@ async def save_to_db_async(url, doc_id, analysis, text, request):
     except Exception as e:
         logger.warning(f"Background save failed: {str(e)}")
 
+async def process_document_with_embeddings(document_text, document_id, metadata):
+    """Process document and create embeddings for RAG"""
+    try:
+        # Create chunks
+        chunks = smart_chunk_for_rag(document_text)
+
+        # Generate embeddings for chunks
+        model = get_embedding_model()
+        embeddings_data = []
+
+        for i, chunk in enumerate(chunks):
+            embedding = model.encode(chunk['text'])
+
+            chunk_id = f"{document_id}_chunk_{i}"
+            chunk_data = {
+                'id': chunk_id,
+                'values': embedding.tolist(),
+                'metadata': {
+                    'document_id': document_id,
+                    'chunk_index': i,
+                    'text': chunk['text'],
+                    'length': chunk['length'],
+                    **metadata
+                }
+            }
+            embeddings_data.append(chunk_data)
+
+        # Store in Pinecone
+        if pinecone_index:
+            pinecone_index.upsert(vectors=embeddings_data, namespace="documents")
+
+        # Store summary embedding for quick document retrieval
+        summary = document_text[:2000]  # First 2000 chars as summary
+        summary_embedding = model.encode(summary)
+
+        summary_data = {
+            'id': f"{document_id}_summary",
+            'values': summary_embedding.tolist(),
+            'metadata': {
+                'document_id': document_id,
+                'type': 'summary',
+                'text': summary,
+                **metadata
+            }
+        }
+
+        if pinecone_index:
+            pinecone_index.upsert(vectors=[summary_data], namespace="summaries")
+
+        return {
+            'chunks_created': len(chunks),
+            'embeddings_stored': len(embeddings_data),
+            'document_id': document_id
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing document embeddings: {str(e)}")
+        return None
+
+async def retrieve_relevant_chunks(query, top_k=5, namespace="documents"):
+    """Retrieve relevant chunks using RAG"""
+    try:
+        if not pinecone_index:
+            return []
+
+        # Generate query embedding
+        model = get_embedding_model()
+        query_embedding = model.encode(query)
+
+        # Search in Pinecone
+        results = pinecone_index.query(
+            vector=query_embedding.tolist(),
+            top_k=top_k,
+            namespace=namespace,
+            include_metadata=True
+        )
+
+        relevant_chunks = []
+        for match in results['matches']:
+            relevant_chunks.append({
+                'text': match['metadata']['text'],
+                'score': match['score'],
+                'document_id': match['metadata']['document_id'],
+                'chunk_index': match['metadata'].get('chunk_index', 0)
+            })
+
+        return relevant_chunks
+
+    except Exception as e:
+        logger.error(f"Error retrieving relevant chunks: {str(e)}")
+        return []
+
+async def enhanced_rag_chat(query, document_ids=None, session_id=None, api_key=None):
+    """Enhanced chat using RAG for better context retrieval"""
+    try:
+        # Retrieve relevant chunks
+        relevant_chunks = await retrieve_relevant_chunks(query, top_k=8)
+
+        # Filter by document_ids if specified
+        if document_ids:
+            relevant_chunks = [
+                chunk for chunk in relevant_chunks
+                if chunk['document_id'] in document_ids
+            ]
+
+        # Build context from relevant chunks
+        context_parts = []
+        for chunk in relevant_chunks[:5]:  # Use top 5 chunks
+            context_parts.append(f"[Score: {chunk['score']:.3f}] {chunk['text'][:500]}...")
+        context = "\n\n".join(context_parts)
+
+        # Build enhanced prompt
+        prompt = f"""Based on the following relevant document excerpts, answer the user's question:
+
+RELEVANT CONTEXT:
+{context}
+
+USER QUESTION: {query}
+
+Provide a comprehensive answer based on the context provided. If the context doesn't contain enough information, mention what additional information might be needed."""
+
+        # Generate response
+        response = direct_api_call_optimized(prompt, api_key)
+
+        return {
+            'response': response,
+            'sources_used': len(relevant_chunks),
+            'relevant_chunks': [
+                {
+                    'document_id': chunk['document_id'],
+                    'score': chunk['score'],
+                    'preview': chunk['text'][:100] + '...'
+                } for chunk in relevant_chunks[:3]
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"RAG chat error: {str(e)}")
+        return {'response': 'Error processing request', 'sources_used': 0}
+
+async def batch_process_documents(urls_batch, api_key, batch_size=10):
+    """Process documents in batches to avoid memory issues"""
+    results = []
+
+    for i in range(0, len(urls_batch), batch_size):
+        batch = urls_batch[i:i + batch_size]
+        logger.info(f"Processing batch {i//batch_size + 1}: {len(batch)} documents")
+
+        # Process batch
+        batch_results = await process_urls_parallel(batch, api_key)
+
+        # Create embeddings for successful results
+        for result in batch_results:
+            if 'text' in result:
+                metadata = {
+                    'url': result['url'],
+                    'processed_at': datetime.utcnow().isoformat()
+                }
+
+                doc_id = hashlib.md5(result['url'].encode()).hexdigest()
+                embedding_result = await process_document_with_embeddings(
+                    result['text'], doc_id, metadata
+                )
+
+                if embedding_result:
+                    result['embedding_info'] = embedding_result
+
+        results.extend(batch_results)
+
+        # Small delay between batches
+        await asyncio.sleep(0.1)
+
+    return results
+
+async def bulk_save_analyses(analyses_data):
+    """Bulk save multiple analyses to database"""
+    if not db_pool or not analyses_data:
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                query = """
+                INSERT INTO policies (
+                    storj_url, document_id, analysis, raw_text,
+                    entityType, sector, subSector, locations, useCases,
+                    created_at_timestamp, updated_at_timestamp,
+                    user_id_uuid, context_id_uuid, org_id_uuid, metadata
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                ON CONFLICT (storj_url) DO NOTHING
+                """
+
+                # Prepare all data for bulk insert
+                bulk_data = []
+                for data in analyses_data:
+                    bulk_data.append((
+                        data['url'], data['document_id'], data['analysis'], data['text'],
+                        json.dumps(data['metadata'].get('entityType', [])),
+                        data['metadata'].get('sector', ''),
+                        data['metadata'].get('subSector'),
+                        json.dumps(data['metadata'].get('locations', [])),
+                        json.dumps(data['metadata'].get('useCases', [])),
+                        data['metadata'].get('created_at_timestamp'),
+                        data['metadata'].get('updated_at_timestamp'),
+                        data['metadata'].get('user_id_uuid'),
+                        data['metadata'].get('context_id_uuid'),
+                        data['metadata'].get('org_id_uuid'),
+                        json.dumps(data['metadata'])
+                    ))
+
+                # Execute bulk insert
+                await conn.executemany(query, bulk_data)
+                return True
+
+    except Exception as e:
+        logger.error(f"Bulk save error: {str(e)}")
+        return False
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database connection on startup"""
+    """Initialize database connection and Pinecone on startup"""
     await init_db()
+    init_pinecone()
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -819,7 +1252,7 @@ async def shutdown_event():
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the Policy Reviewer API with Chat History. Visit /docs for API documentation."}
+    return {"message": "Welcome to the Policy Reviewer API with Chat History and RAG. Visit /docs for API documentation."}
 
 @app.get("/api/status", response_model=ApiStatusResponse)
 async def check_api_status():
@@ -841,7 +1274,7 @@ async def analyze_policy_text(request: PolicyAnalysisRequest):
     request_id = generate_unique_id()
 
     document_id = hashlib.md5(request.text.encode()).hexdigest()
-    document_cache[document_id] = request.text
+    enhanced_document_cache.set(document_id, request.text)
 
     prompt = f"""Analyze the following policy document and provide a detailed review:
 
@@ -1037,13 +1470,14 @@ async def enhanced_chat_with_document(request: ChatRequest):
 
     document_context = ""
     if request.document_id:
-        if request.document_id in document_cache:
-            document_context = f"Document Context:\n{document_cache[request.document_id][:2000]}...\n\n"
+        cached_doc = enhanced_document_cache.get(request.document_id)
+        if cached_doc:
+            document_context = f"Document Context:\n{cached_doc[:2000]}...\n\n"
         else:
             db_document = await get_document_from_db(request.document_id)
             if db_document:
                 document_context = f"Document Context:\n{db_document[:2000]}...\n\n"
-                document_cache[request.document_id] = db_document
+                enhanced_document_cache.set(request.document_id, db_document)
 
     conversation_history = ""
     for msg in chat_history["conversation_context"][-10:]:
@@ -1112,11 +1546,12 @@ Format your response appropriately and maintain consistency with the established
 async def list_documents():
     """List all cached documents"""
     documents = []
-    for doc_id, content in document_cache.items():
+    for doc_id, content in enhanced_document_cache.cache.items():
         documents.append({
             "document_id": doc_id,
             "content_preview": content[:200] + "..." if len(content) > 200 else content,
-            "content_length": len(content)
+            "content_length": len(content),
+            "last_accessed": enhanced_document_cache.access_times.get(doc_id, time.time())
         })
 
     return JSONResponse(content={
@@ -1127,10 +1562,14 @@ async def list_documents():
 @app.get("/api/documents/{document_id}")
 async def get_document(document_id: str):
     """Get a specific document by ID"""
-    if document_id not in document_cache:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    content = document_cache[document_id]
+    content = enhanced_document_cache.get(document_id)
+    if not content:
+        db_content = await get_document_from_db(document_id)
+        if db_content:
+            enhanced_document_cache.set(document_id, db_content)
+            content = db_content
+        else:
+            raise HTTPException(status_code=404, detail="Document not found")
 
     return JSONResponse(content={
         "document_id": document_id,
@@ -1141,13 +1580,13 @@ async def get_document(document_id: str):
 @app.delete("/api/documents/{document_id}")
 async def delete_document(document_id: str):
     """Delete a cached document"""
-    if document_id not in document_cache:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    del document_cache[document_id]
+    if document_id in enhanced_document_cache.cache:
+        del enhanced_document_cache.cache[document_id]
+        if document_id in enhanced_document_cache.access_times:
+            del enhanced_document_cache.access_times[document_id]
 
     return JSONResponse(content={
-        "message": f"Document {document_id} deleted successfully"
+        "message": f"Document {document_id} deleted from cache if it existed"
     })
 
 @app.get("/api/analysis/status/{request_id}")
@@ -1171,15 +1610,286 @@ async def get_analysis_status(request_id: str):
 async def health_check():
     """Health check endpoint"""
     db_status = "connected" if db_pool else "not configured"
+    pinecone_status = "connected" if pinecone_index else "not configured"
 
     return JSONResponse(content={
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "database": db_status,
-        "cached_documents": len(document_cache),
+        "pinecone": pinecone_status,
+        "cached_documents": len(enhanced_document_cache.cache),
         "cached_chat_sessions": len(chat_history_cache),
-        "version": "1.0.0"
+        "version": "2.0.0"
     })
+
+@app.post("/api/analyze/bulk")
+async def analyze_bulk_documents(request: PolicyAnalysisFileRequest):
+    """Bulk analyze up to 1000 documents with RAG pipeline"""
+    try:
+        api_key = get_api_key(request.api_key)
+        if not api_key:
+            raise HTTPException(status_code=400, detail="API key required")
+
+        if not request.storj_urls:
+            raise HTTPException(status_code=400, detail="No URLs provided")
+
+        if len(request.storj_urls) > 1000:
+            raise HTTPException(status_code=400, detail="Maximum 1000 documents allowed")
+
+        request_id = generate_unique_id()
+
+        # Initialize progress tracking
+        analysis_progress[request_id] = {
+            'status': 'starting',
+            'total_documents': len(request.storj_urls),
+            'processed_documents': 0,
+            'failed_documents': 0,
+            'batch_size': 20,
+            'start_time': time.time()
+        }
+
+        # Process in background
+        asyncio.create_task(process_bulk_documents_async(
+            request.storj_urls, request, api_key, request_id
+        ))
+
+        return JSONResponse(content={
+            "request_id": request_id,
+            "status": "processing_started",
+            "total_documents": len(request.storj_urls),
+            "estimated_time_minutes": len(request.storj_urls) * 0.5,  # Rough estimate
+            "check_status_url": f"/api/bulk/status/{request_id}"
+        })
+
+    except Exception as e:
+        logger.error(f"Bulk analysis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def process_bulk_documents_async(urls, request, api_key, request_id):
+    """Background task for bulk document processing"""
+    try:
+        analysis_progress[request_id]['status'] = 'processing'
+
+        # Process in batches
+        batch_size = 20
+        all_results = []
+        failed_count = 0
+
+        for i in range(0, len(urls), batch_size):
+            batch_urls = urls[i:i + batch_size]
+
+            # Process batch
+            batch_results = await batch_process_documents(batch_urls, api_key, batch_size=10)
+
+            # Count successful and failed
+            for result in batch_results:
+                if 'error' in result:
+                    failed_count += 1
+                else:
+                    all_results.append(result)
+
+            # Update progress
+            analysis_progress[request_id]['processed_documents'] = min(i + batch_size, len(urls))
+            analysis_progress[request_id]['failed_documents'] = failed_count
+
+            # Small delay between batches
+            await asyncio.sleep(0.5)
+
+        # Bulk save successful results
+        if all_results:
+            analyses_data = []
+            for result in all_results:
+                if 'text' in result:
+                    doc_id = hashlib.md5(result['url'].encode()).hexdigest()
+
+                    # Quick analysis for bulk processing
+                    analysis = f"Document processed: {len(result['text'])} characters"
+                    if result.get('embedding_info'):
+                        analysis += f", {result['embedding_info']['chunks_created']} chunks created"
+
+                    analyses_data.append({
+                        'url': result['url'],
+                        'document_id': doc_id,
+                        'analysis': analysis,
+                        'text': result['text'],
+                        'metadata': {
+                            'entityType': request.entityType,
+                            'sector': request.sector,
+                            'subSector': request.subSector,
+                            'created_at_timestamp': datetime.utcnow().isoformat(),
+                            'updated_at_timestamp': datetime.utcnow().isoformat(),
+                            'user_id_uuid': request.user_id_uuid or str(uuid.uuid4()),
+                            'context_id_uuid': request.context_id_uuid or str(uuid.uuid4()),
+                            'org_id_uuid': request.org_id_uuid
+                        }
+                    })
+
+            await bulk_save_analyses(analyses_data)
+
+        # Mark as completed
+        analysis_progress[request_id]['status'] = 'completed'
+        analysis_progress[request_id]['end_time'] = time.time()
+        analysis_progress[request_id]['total_processed'] = len(all_results)
+
+    except Exception as e:
+        analysis_progress[request_id]['status'] = 'error'
+        analysis_progress[request_id]['error'] = str(e)
+        logger.error(f"Bulk processing error: {str(e)}")
+
+@app.get("/api/bulk/status/{request_id}")
+async def get_bulk_processing_status(request_id: str):
+    """Get status of bulk processing"""
+    if request_id not in analysis_progress:
+        raise HTTPException(status_code=404, detail="Request ID not found")
+
+    progress = analysis_progress[request_id]
+
+    # Calculate progress percentage
+    if progress['total_documents'] > 0:
+        progress_percentage = (progress['processed_documents'] / progress['total_documents']) * 100
+    else:
+        progress_percentage = 0
+
+    response = {
+        "request_id": request_id,
+        "status": progress['status'],
+        "progress_percentage": round(progress_percentage, 2),
+        "processed_documents": progress['processed_documents'],
+        "total_documents": progress['total_documents'],
+        "failed_documents": progress['failed_documents']
+    }
+
+    if 'start_time' in progress:
+        elapsed_time = time.time() - progress['start_time']
+        response['elapsed_time_seconds'] = round(elapsed_time, 2)
+
+        if progress['processed_documents'] > 0:
+            avg_time_per_doc = elapsed_time / progress['processed_documents']
+            remaining_docs = progress['total_documents'] - progress['processed_documents']
+            estimated_remaining = remaining_docs * avg_time_per_doc
+            response['estimated_remaining_seconds'] = round(estimated_remaining, 2)
+
+    if progress['status'] == 'error':
+        response['error'] = progress.get('error', 'Unknown error')
+
+    return JSONResponse(content=response)
+
+@app.post("/api/chat/rag", response_model=ChatResponse)
+async def rag_enhanced_chat(request: ChatRequest):
+    """RAG-enhanced chat endpoint"""
+    api_key = get_api_key(request.api_key)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key required")
+
+    session_id = request.session_id or generate_session_id()
+
+    # Use RAG for better context retrieval
+    rag_result = await enhanced_rag_chat(
+        query=request.message,
+        document_ids=[request.document_id] if request.document_id else None,
+        session_id=session_id,
+        api_key=api_key
+    )
+
+    # Get or create chat history
+    chat_history = await get_chat_history_from_db(session_id)
+    if not chat_history:
+        chat_history = {
+            "conversation_context": [],
+            "assistant_response": [],
+            "system_role": create_system_role(
+                request.sector, request.subsector,
+                request.jurisdictions, request.roles, request.use_cases
+            ),
+            "document_id": request.document_id,
+            "updated_at": time.time()
+        }
+
+    # Add user message
+    user_message = {
+        "role": "user",
+        "content": [{"type": "text", "text": request.message}]
+    }
+    chat_history["conversation_context"].append(user_message)
+
+    # Add assistant response
+    assistant_message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": rag_result['response']}]
+    }
+    chat_history["conversation_context"].append(assistant_message)
+    chat_history["assistant_response"] = [{"type": "text", "text": rag_result['response']}]
+
+    # Save to database
+    await save_chat_history_to_db(session_id, chat_history)
+
+    return JSONResponse(content={
+        "response": rag_result['response'],
+        "session_id": session_id,
+        "document_id": request.document_id,
+        "conversation_context": chat_history["conversation_context"],
+        "assistant_response": chat_history["assistant_response"],
+        "rag_info": {
+            "sources_used": rag_result['sources_used'],
+            "relevant_chunks": rag_result.get('relevant_chunks', [])
+        }
+    })
+
+@app.post("/api/search")
+async def search_documents(query: str, top_k: int = 10, document_ids: List[str] = None):
+    """Search across all documents using RAG"""
+    try:
+        relevant_chunks = await retrieve_relevant_chunks(query, top_k=top_k)
+
+        if document_ids:
+            relevant_chunks = [
+                chunk for chunk in relevant_chunks
+                if chunk['document_id'] in document_ids
+            ]
+
+        return JSONResponse(content={
+            "query": query,
+            "total_results": len(relevant_chunks),
+            "results": [
+                {
+                    "document_id": chunk['document_id'],
+                    "score": chunk['score'],
+                    "text_preview": chunk['text'][:200] + "...",
+                    "chunk_index": chunk['chunk_index']
+                } for chunk in relevant_chunks
+            ]
+        })
+
+    except Exception as e:
+        logger.error(f"Search error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/cleanup")
+async def cleanup_cache():
+    """Cleanup old cache entries"""
+    try:
+        # Clean document cache
+        enhanced_document_cache.clear_old_entries(max_age_hours=24)
+
+        # Clean progress tracking
+        current_time = time.time()
+        old_progress_keys = [
+            key for key, progress in analysis_progress.items()
+            if current_time - progress.get('start_time', current_time) > 3600  # 1 hour
+        ]
+
+        for key in old_progress_keys:
+            del analysis_progress[key]
+
+        return JSONResponse(content={
+            "message": "Cache cleanup completed",
+            "active_documents": len(enhanced_document_cache.cache),
+            "active_progress_items": len(analysis_progress)
+        })
+
+    except Exception as e:
+        logger.error(f"Cleanup error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):

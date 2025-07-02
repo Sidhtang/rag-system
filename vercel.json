@@ -14,14 +14,49 @@
   ],
   "env": {
     "GEMINI_API_KEY": "@gemini_api_key",
-    "PINECONE_API_KEY": "@pinecone_api_key",
-    "PINECONE_ENVIRONMENT": "@pinecone_environment",
-    "PINECONE_INDEX_NAME": "@pinecone_index_name"
+    "DATABASE_URL": "@database_url",
+    "PYTHON_VERSION": "3.9"
   },
   "functions": {
     "api/index.py": {
-      "memory": 1024,
-      "maxDuration": 300
+      "memory": 3008,
+      "maxDuration": 300,
+      "runtime": "python3.9",
+      "regions": ["iad1", "sfo1"]
     }
-  }
+  },
+  "regions": ["iad1", "sfo1"],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache, no-store, must-revalidate"
+        },
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, POST, PUT, DELETE, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type, Authorization"
+        }
+      ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/docs",
+      "destination": "/api/docs"
+    },
+    {
+      "source": "/openapi.json",
+      "destination": "/api/openapi.json"
+    }
+  ]
 }

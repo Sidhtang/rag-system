@@ -1,4 +1,3 @@
-
 import uvicorn
 import base64
 import hashlib
@@ -77,6 +76,12 @@ retry_strategy = Retry(
 adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
+
+# Add this to your imports
+from rag_pipeline import RAGPipeline
+
+# Initialize RAG pipeline with your FastAPI app
+rag_pipeline = RAGPipeline()
 
 def get_api_key(api_key: Optional[str] = None):
     """Get API key from environment variable or request"""
@@ -867,76 +872,120 @@ async def analyze_policy_text(request: PolicyAnalysisRequest):
     })
 
 @app.post("/api/analyze/file")
-async def analyze_policy_file_optimized(request: PolicyAnalysisFileRequest):
-    """Optimized file analysis endpoint"""
+async def analyze_policy_file(request: PolicyAnalysisFileRequest):
     try:
-        # Quick validation
         api_key = get_api_key(request.api_key)
         if not api_key:
-            raise HTTPException(status_code=400, detail="API key required")
+            raise HTTPException(status_code=400, detail="API key is required")
 
-        if not request.storj_urls:
-            raise HTTPException(status_code=400, detail="No URLs provided")
-
-        # Process URLs in parallel
-        processed_files = await process_urls_parallel(request.storj_urls, api_key)
-
-        # Handle cached results
-        for file_result in processed_files:
-            if file_result.get("cached"):
-                cached_result = file_result["result"]
-                return JSONResponse(content={
-                    "analysis": cached_result["analysis"],
-                    "request_id": generate_unique_id(),
-                    "document_id": cached_result["document_id"],
-                    "from_cache": True,
-                    "cached_at": str(cached_result["created_at_timestamp"])
-                })
-
-        if not processed_files:
-            raise HTTPException(status_code=400, detail="No files processed successfully")
-
-        # Combine text efficiently
-        all_text = []
-        for file_result in processed_files:
-            if "text" in file_result:
-                all_text.append(f"=== {file_result['url']} ===\n{file_result['text']}")
-
-        combined_text = "\n\n===DOCUMENT SEPARATOR===\n\n".join(all_text)
-
-        # Generate document ID
-        document_id = hashlib.md5(combined_text.encode()).hexdigest()
-
-        # Store in cache
-        document_cache[document_id] = combined_text
-
-        # Build concise prompt
-        prompt_context = build_concise_prompt(request)
-
-        # Run fast analysis
         request_id = generate_unique_id()
-        analysis_result = await analyze_large_document_fast(
-            combined_text, prompt_context, api_key, request_id
-        )
 
-        # Save to database without blocking (fire and forget)
-        asyncio.create_task(save_to_db_async(request.storj_urls[0], document_id,
-                                           analysis_result, combined_text, request))
+        # Process URLs and collect texts
+        all_collection_names = []
+        for url in request.storj_urls:
+            try:
+                # Download content
+                content = download_from_storj_url(url)
+
+                # Extract text from PDF
+                text = extract_text_from_pdf_fast(content)
+
+                # Process through RAG pipeline
+                metadata = {
+                    "url": url,
+                    "sector": request.sector,
+                    "subSector": request.subSector,
+                    "entityType": request.entityType,
+                }
+
+                collection_name = await rag_pipeline.process_text(text, metadata)
+                all_collection_names.append(collection_name)
+
+            except Exception as e:
+                logger.error(f"Error processing URL {url}: {str(e)}")
+                continue
+
+        if not all_collection_names:
+            raise HTTPException(status_code=400, detail="No documents were successfully processed")
+
+        # Define analysis queries based on request context
+        analysis_queries = [
+            f"What are the key compliance requirements for {request.sector} sector?",
+            f"What are the specific requirements for {', '.join(request.entityType)}?",
+            "What are the main risks and challenges?",
+            f"What are the geographical considerations for {', '.join([loc.continent for loc in request.locations])}?",
+        ]
+
+        # Add use case specific queries
+        for use_case in request.useCases:
+            analysis_queries.append(f"What are the requirements and considerations for {use_case.category}?")
+
+        # Retrieve relevant contexts for each query
+        all_contexts = []
+        for collection_name in all_collection_names:
+            for query in analysis_queries:
+                try:
+                    relevant_chunks = await rag_pipeline.retrieve_relevant_chunks(
+                        query,
+                        collection_name
+                    )
+                    context = rag_pipeline.get_context_string(relevant_chunks)
+                    all_contexts.append(f"Query: {query}\n{context}")
+                except Exception as e:
+                    logger.warning(f"Error retrieving chunks for query '{query}': {str(e)}")
+                    continue
+
+        # Combine contexts and create final prompt
+        combined_context = "\n\n".join(all_contexts)
+
+        prompt = f"""
+        Based on the following extracted contexts from the policy documents:
+
+        {combined_context}
+
+        Please provide a comprehensive analysis for:
+        Sector: {request.sector}
+        SubSector: {request.subSector}
+        Entity Types: {', '.join(request.entityType)}
+
+        Locations:
+        {format_locations(request.locations)}
+
+        Use Cases:
+        {format_use_cases(request.useCases)}
+
+        Provide:
+        1. Executive Summary
+        2. Key Compliance Requirements
+        3. Geographic-specific Considerations
+        4. Entity-specific Requirements
+        5. Use Case Analysis
+        6. Risk Assessment
+        7. Implementation Recommendations
+
+        Format the response in markdown with clear sections.
+        """
+
+        # Get analysis from Gemini
+        analysis_result = direct_api_call_optimized(prompt, api_key)
 
         return JSONResponse(content={
             "analysis": analysis_result,
             "request_id": request_id,
-            "document_id": document_id,
-            "raw_text": combined_text[:1000] + "..." if len(combined_text) > 1000 else combined_text,
             "from_cache": False,
-            "processing_optimized": True
+            "metadata": {
+                "entityType": request.entityType,
+                "sector": request.sector,
+                "subSector": request.subSector,
+                "locations": [loc.dict() for loc in request.locations],
+                "useCases": [uc.dict() for uc in request.useCases],
+                "processed_documents": len(all_collection_names)
+            }
         })
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error in analyze_policy_file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def enhanced_chat_with_document(request: ChatRequest):

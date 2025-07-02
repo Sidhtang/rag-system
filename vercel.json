@@ -8,11 +8,47 @@
   ],
   "routes": [
     {
+      "src": "/api/(.*)",
+      "dest": "api/index.py"
+    },
+    {
       "src": "/(.*)",
       "dest": "api/index.py"
     }
   ],
   "env": {
-    "PYTHONPATH": "."
-  }
+    "GEMINI_API_KEY": "@gemini_api_key",
+    "PINECONE_API_KEY": "@pinecone_api_key",
+    "PINECONE_ENVIRONMENT": "@pinecone_environment",
+    "PINECONE_INDEX_NAME": "@pinecone_index_name",
+    "DATABASE_URL": "@database_url"
+  },
+  "functions": {
+    "api/index.py": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  },
+  "regions": ["iad1"],
+  "buildCommand": "pip install -r requirements.txt",
+  "installCommand": "python -m pip install --upgrade pip",
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, POST, PUT, DELETE, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "*"
+        }
+      ]
+    }
+  ]
 }

@@ -105,11 +105,9 @@ class VectorStore:
 
         for sentence in sentences:
             sentence_length = len(sentence)
-
             if current_length + sentence_length > chunk_size and current_chunk:
                 chunk_text = '. '.join(current_chunk) + '.'
                 chunks.append(chunk_text)
-
                 overlap_sentences = current_chunk[-overlap//50:] if len(current_chunk) > overlap//50 else current_chunk
                 current_chunk = overlap_sentences + [sentence]
                 current_length = sum(len(s) for s in current_chunk)
@@ -125,7 +123,6 @@ class VectorStore:
     async def add_document(self, document_id: str, text: str, metadata: Dict = None):
         """Add document to vector store"""
         await self.initialize()
-
         chunks = self.chunk_document(text)
         embeddings = self.model.encode(chunks, convert_to_tensor=False)
 
@@ -141,6 +138,17 @@ class VectorStore:
                 'chunk_index': i
             }
             self.chunk_metadata[chunk_id] = metadata or {}
+
+            # Store chunk in database
+            await save_document_chunk(
+                chunk_id,
+                document_id,
+                i,
+                chunk,
+                embeddings[i].tobytes(),
+                hashlib.sha256(chunk.encode()).hexdigest(),
+                metadata or {}
+            )
 
     async def similarity_search(self, query: str, k: int = 5, score_threshold: float = 0.7) -> List[Dict]:
         """Search for similar chunks"""
@@ -161,6 +169,9 @@ class VectorStore:
                     'chunk_id': chunk_data['id'],
                     'metadata': self.chunk_metadata.get(chunk_data['id'], {})
                 })
+
+        # Log the search in database
+        await log_vector_search(query, results)
 
         return results
 
@@ -253,9 +264,11 @@ def direct_api_call_optimized(prompt, api_key, max_retries=2):
     """Optimized API call with session reuse"""
     if not api_key:
         raise ValueError("API key is required")
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
     try:
         response = session.post(url, json=payload, headers=headers, timeout=45)
         if response.status_code == 200:
@@ -278,25 +291,32 @@ def download_from_storj_url(url: str) -> bytes:
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1'
         }
+
         response = requests.get(url, timeout=60, headers=headers, stream=True)
         logger.info(f"Response status: {response.status_code}")
         logger.info(f"Content-Type: {response.headers.get('content-type', 'unknown')}")
         logger.info(f"Content-Length: {response.headers.get('content-length', 'unknown')}")
+
         if response.status_code == 403:
             raise HTTPException(status_code=400, detail="Access denied. The presigned URL may have expired or is invalid.")
         elif response.status_code == 404:
             raise HTTPException(status_code=400, detail="File not found at the provided URL.")
         elif response.status_code != 200:
             raise HTTPException(status_code=400, detail=f"Failed to download file. HTTP {response.status_code}: {response.reason}")
+
         response.raise_for_status()
         content = response.content
+
         if len(content) == 0:
             raise HTTPException(status_code=400, detail="Downloaded file is empty")
+
         logger.info(f"Successfully downloaded {len(content)} bytes")
+
         if content[:4] == b'%PDF':
             logger.info("Downloaded content appears to be a valid PDF")
         else:
             logger.info(f"Downloaded content starts with: {content[:20]}")
+
         return content
     except requests.exceptions.Timeout:
         logger.error(f"Timeout while downloading from URL: {url}")
@@ -345,11 +365,13 @@ def extract_text_from_pdf_fast(pdf_bytes):
     try:
         if not pdf_bytes or len(pdf_bytes) < 4:
             return "Invalid PDF file"
+
         text_parts = []
         pdf_file = BytesIO(pdf_bytes)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         total_pages = len(pdf_reader.pages)
         logger.info(f"Processing PDF with {total_pages} pages")
+
         batch_size = 10
         for start_page in range(0, total_pages, batch_size):
             end_page = min(start_page + batch_size, total_pages)
@@ -363,8 +385,10 @@ def extract_text_from_pdf_fast(pdf_bytes):
                 except Exception as e:
                     logger.warning(f"Error on page {page_num + 1}: {str(e)}")
                     continue
+
         if not text_parts:
             return "No text extracted from PDF"
+
         full_text = "\n\n".join(text_parts)
         logger.info(f"Extracted {len(full_text)} characters from {total_pages} pages")
         return full_text
@@ -413,10 +437,12 @@ def smart_chunk_text(text, max_chunk_size=150000):
     """Smarter chunking that preserves context"""
     if len(text) <= max_chunk_size:
         return [text]
+
     sections = text.split('\n\n')
     chunks = []
     current_chunk = []
     current_size = 0
+
     for section in sections:
         section_size = len(section) + 2
         if current_size + section_size > max_chunk_size and current_chunk:
@@ -426,8 +452,10 @@ def smart_chunk_text(text, max_chunk_size=150000):
         else:
             current_chunk.append(section)
             current_size += section_size
+
     if current_chunk:
         chunks.append('\n\n'.join(current_chunk))
+
     return chunks
 
 def download_and_process_single_url(url, api_key):
@@ -438,11 +466,13 @@ def download_and_process_single_url(url, api_key):
         cached_result = loop.run_until_complete(check_url_exists_in_db(url))
         if cached_result:
             return {"cached": True, "result": cached_result}
+
         content = download_from_storj_url(url)
         if content[:4] == b'%PDF':
             text = extract_text_from_pdf_fast(content)
         else:
             text = content.decode('utf-8', errors='replace')
+
         return {"cached": False, "url": url, "text": text, "content": content}
     except Exception as e:
         return {"error": str(e), "url": url}
@@ -454,11 +484,13 @@ async def process_urls_parallel(storj_urls, api_key):
     for url in storj_urls:
         task = loop.run_in_executor(thread_pool, download_and_process_single_url, url, api_key)
         tasks.append(task)
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
     successful_results = []
     for result in results:
         if isinstance(result, dict) and "error" not in result:
             successful_results.append(result)
+
     return successful_results
 
 def make_gemini_api_call(prompt, api_key):
@@ -477,6 +509,7 @@ async def analyze_chunks_parallel(chunks, prompt_context, api_key):
         """
         task = loop.run_in_executor(thread_pool, make_gemini_api_call, chunk_prompt, api_key)
         tasks.append(task)
+
     batch_size = 3
     all_results = []
     for i in range(0, len(tasks), batch_size):
@@ -485,23 +518,29 @@ async def analyze_chunks_parallel(chunks, prompt_context, api_key):
         all_results.extend(batch_results)
         if i + batch_size < len(tasks):
             await asyncio.sleep(0.5)
+
     return [r for r in all_results if not isinstance(r, Exception)]
 
 async def analyze_large_document_fast(text, prompt_context, api_key, request_id):
     """Fast document analysis with parallel processing"""
     chunks = smart_chunk_text(text, max_chunk_size=150000)
+
     if len(chunks) == 1:
         full_prompt = f"{prompt_context}\n\nDocument: {text}"
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(thread_pool, make_gemini_api_call, full_prompt, api_key)
+
     chunk_analyses = await analyze_chunks_parallel(chunks, prompt_context, api_key)
     combined_analysis = "\n\n".join([f"## Section {i+1}\n{analysis}"
                                    for i, analysis in enumerate(chunk_analyses)])
+
     synthesis_prompt = f"""Based on these section analyses, provide a brief synthesis:
     {combined_analysis[:6000]}...
     Provide: 1) Key summary 2) Main findings 3) Critical recommendations"""
+
     loop = asyncio.get_event_loop()
     final_synthesis = await loop.run_in_executor(thread_pool, make_gemini_api_call, synthesis_prompt, api_key)
+
     return f"{combined_analysis}\n\n## Executive Summary\n{final_synthesis}"
 
 def build_concise_prompt(request):
@@ -536,58 +575,189 @@ async def init_db():
                 }
             )
             logger.info("Database connection pool created successfully")
-            async with db_pool.acquire() as conn:
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS chat_history (
-                        id SERIAL PRIMARY KEY,
-                        session_id UUID UNIQUE NOT NULL,
-                        conversation_context JSONB NOT NULL DEFAULT '[]',
-                        assistant_response JSONB NOT NULL DEFAULT '[]',
-                        system_role JSONB NOT NULL DEFAULT '{}',
-                        document_id VARCHAR(255),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS policies (
-                        id SERIAL PRIMARY KEY,
-                        storj_url TEXT UNIQUE,
-                        document_id VARCHAR(255) NOT NULL,
-                        analysis TEXT NOT NULL,
-                        raw_text TEXT,
-                        entityType JSONB,
-                        sector VARCHAR(255),
-                        subSector VARCHAR(255),
-                        locations JSONB,
-                        useCases JSONB,
-                        created_at_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        user_id_uuid UUID,
-                        context_id_uuid UUID,
-                        org_id_uuid UUID,
-                        metadata JSONB
-                    )
-                """)
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS documents (
-                        id SERIAL PRIMARY KEY,
-                        document_id VARCHAR(255) UNIQUE NOT NULL,
-                        content TEXT NOT NULL,
-                        metadata JSONB DEFAULT '{}',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+
+            # Create tables if they don't exist
+            await create_tables()
+
         except Exception as e:
             logger.error(f"Error creating database connection pool: {str(e)}")
             raise
+
+async def create_tables():
+    """Create all necessary database tables"""
+    async with db_pool.acquire() as conn:
+        # Create chat_history table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id SERIAL PRIMARY KEY,
+                session_id UUID UNIQUE NOT NULL,
+                conversation_context JSONB NOT NULL DEFAULT '[]',
+                assistant_response JSONB NOT NULL DEFAULT '[]',
+                system_role JSONB NOT NULL DEFAULT '{}',
+                document_id VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create policies table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS policies (
+                id SERIAL PRIMARY KEY,
+                storj_url TEXT UNIQUE,
+                document_id VARCHAR(255) NOT NULL,
+                analysis TEXT NOT NULL,
+                raw_text TEXT,
+                entityType JSONB,
+                sector VARCHAR(255),
+                subSector VARCHAR(255),
+                locations JSONB,
+                useCases JSONB,
+                created_at_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id_uuid UUID,
+                context_id_uuid UUID,
+                org_id_uuid UUID,
+                metadata JSONB
+            )
+        """)
+
+        # Create documents table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id SERIAL PRIMARY KEY,
+                document_id VARCHAR(255) UNIQUE NOT NULL,
+                content TEXT NOT NULL,
+                metadata JSONB DEFAULT '{}',
+                chunk_count INTEGER DEFAULT 0,
+                processing_status VARCHAR(50) DEFAULT 'pending',
+                vector_indexed BOOLEAN DEFAULT FALSE,
+                file_hash VARCHAR(64),
+                content_type VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create document_chunks table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id SERIAL PRIMARY KEY,
+                chunk_id VARCHAR(255) UNIQUE NOT NULL,
+                document_id VARCHAR(255) NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                embedding_vector BYTEA,
+                chunk_hash VARCHAR(64) NOT NULL,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create vector_search_sessions table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS vector_search_sessions (
+                id SERIAL PRIMARY KEY,
+                session_id UUID NOT NULL,
+                query_text TEXT NOT NULL,
+                search_results JSONB DEFAULT '[]',
+                relevant_chunks INTEGER DEFAULT 0,
+                search_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create document_processing_queue table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS document_processing_queue (
+                id SERIAL PRIMARY KEY,
+                document_id VARCHAR(255) NOT NULL,
+                storj_url TEXT NOT NULL,
+                processing_status VARCHAR(50) DEFAULT 'queued',
+                priority INTEGER DEFAULT 1,
+                retry_count INTEGER DEFAULT 0,
+                error_message TEXT,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+
+        # Create batch_processing_jobs table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS batch_processing_jobs (
+                id SERIAL PRIMARY KEY,
+                batch_id VARCHAR(255) UNIQUE NOT NULL,
+                total_documents INTEGER NOT NULL,
+                processed_documents INTEGER DEFAULT 0,
+                failed_documents INTEGER DEFAULT 0,
+                status VARCHAR(50) DEFAULT 'started',
+                user_id_uuid UUID,
+                context_id_uuid UUID,
+                org_id_uuid UUID,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+
+        # Create indexes
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_session_id ON chat_history (session_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_updated ON chat_history (updated_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_policies_sector_location ON policies (sector, (locations->>'continent'))")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_content_type ON documents (content_type, vector_indexed)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_doc_id ON document_chunks (document_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_hash ON document_chunks (chunk_hash)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_vector_search_session_id ON vector_search_sessions (session_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_vector_search_timestamp ON vector_search_sessions (search_timestamp)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_processing_queue_status ON document_processing_queue (processing_status)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_processing_queue_priority ON document_processing_queue (priority)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_processing_queue_created ON document_processing_queue (created_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_jobs_status ON batch_processing_jobs (status)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_jobs_user ON batch_processing_jobs (user_id_uuid)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_jobs_org ON batch_processing_jobs (org_id_uuid)")
+
+        # Create function for getting document chunks
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION get_document_chunks(doc_id VARCHAR(255))
+            RETURNS TABLE(chunk_id VARCHAR(255), chunk_text TEXT, chunk_index INTEGER) AS $$
+            BEGIN
+                RETURN QUERY
+                SELECT dc.chunk_id, dc.chunk_text, dc.chunk_index
+                FROM document_chunks dc
+                WHERE dc.document_id = doc_id
+                ORDER BY dc.chunk_index;
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
+
+        # Create function for cleaning up old sessions
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION cleanup_old_sessions(days_old INTEGER DEFAULT 7)
+            RETURNS INTEGER AS $$
+            DECLARE
+                deleted_count INTEGER;
+            BEGIN
+                DELETE FROM vector_search_sessions
+                WHERE search_timestamp < NOW() - INTERVAL '%s days' USING days_old;
+
+                GET DIAGNOSTICS deleted_count = ROW_COUNT;
+
+                DELETE FROM chat_history
+                WHERE updated_at < NOW() - INTERVAL '%s days' USING days_old;
+
+                RETURN deleted_count;
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
 
 async def save_chat_history_to_db(session_id: str, chat_data: Dict[str, Any]) -> bool:
     """Save chat history to database"""
     if not db_pool:
         logger.error("Database connection pool is not initialized")
         return False
+
     try:
         async with db_pool.acquire() as conn:
             async with conn.transaction():
@@ -622,6 +792,7 @@ async def get_chat_history_from_db(session_id: str) -> Optional[Dict[str, Any]]:
     if not db_pool:
         logger.error("Database connection pool is not initialized")
         return None
+
     try:
         async with db_pool.acquire() as conn:
             query = """
@@ -642,6 +813,7 @@ async def get_chat_history_from_db(session_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error retrieving chat history from database: {str(e)}")
         return None
+
     return None
 
 async def check_url_exists_in_db(storj_url: str) -> Optional[Dict]:
@@ -649,6 +821,7 @@ async def check_url_exists_in_db(storj_url: str) -> Optional[Dict]:
     if not db_pool:
         logger.error("Database connection pool is not initialized")
         return None
+
     try:
         if is_storj_url(storj_url):
             base_path = get_storj_base_path(storj_url)
@@ -673,6 +846,7 @@ async def check_url_exists_in_db(storj_url: str) -> Optional[Dict]:
                 LIMIT 1
                 """
                 row = await conn.fetchrow(query, storj_url)
+
         if row:
             logger.info(f"Found existing URL in database")
             return {
@@ -685,6 +859,7 @@ async def check_url_exists_in_db(storj_url: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Error checking URL in database: {str(e)}")
         return None
+
     return None
 
 async def save_analysis_to_db(
@@ -698,6 +873,7 @@ async def save_analysis_to_db(
     if not db_pool:
         logger.error("Database connection pool is not initialized")
         return False
+
     try:
         logger.info(f"Saving analysis to database for URL: {storj_url}")
         async with db_pool.acquire() as conn:
@@ -718,6 +894,7 @@ async def save_analysis_to_db(
                 """
                 locations_json = [loc.dict() for loc in metadata.get("locations", [])]
                 use_cases_json = [uc.dict() for uc in metadata.get("useCases", [])]
+
                 await conn.execute(
                     query,
                     storj_url, document_id, analysis, raw_text,
@@ -743,23 +920,45 @@ async def save_document_to_db(document_id: str, content: str, metadata: Dict[str
     if not db_pool:
         logger.error("Database connection pool is not initialized")
         return False
+
     try:
         async with db_pool.acquire() as conn:
             async with conn.transaction():
+                # Calculate file hash
+                file_hash = hashlib.sha256(content.encode()).hexdigest()
+
+                # Determine content type
+                content_type = "text/plain"
+                if content.startswith('%PDF'):
+                    content_type = "application/pdf"
+
                 query = """
                 INSERT INTO documents (
-                    document_id, content, metadata, created_at, updated_at
-                ) VALUES ($1, $2, $3, $4, $5)
+                    document_id, content, metadata, chunk_count,
+                    processing_status, vector_indexed, file_hash, content_type,
+                    created_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (document_id) DO UPDATE SET
                     content = $2,
                     metadata = $3,
-                    updated_at = $5
+                    chunk_count = $4,
+                    processing_status = $5,
+                    vector_indexed = $6,
+                    file_hash = $7,
+                    content_type = $8,
+                    updated_at = $10
                 """
+
                 await conn.execute(
                     query,
                     document_id,
                     content,
                     json.dumps(metadata),
+                    metadata.get("chunk_count", 0),
+                    metadata.get("processing_status", "completed"),
+                    metadata.get("vector_indexed", False),
+                    file_hash,
+                    content_type,
                     datetime.utcnow(),
                     datetime.utcnow()
                 )
@@ -773,6 +972,7 @@ async def get_document_from_db(document_id: str) -> Optional[str]:
     if not db_pool:
         logger.error("Database connection pool is not initialized")
         return None
+
     try:
         async with db_pool.acquire() as conn:
             query = "SELECT content FROM documents WHERE document_id = $1"
@@ -782,7 +982,214 @@ async def get_document_from_db(document_id: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Error retrieving document from database: {str(e)}")
         return None
+
     return None
+
+async def save_document_chunk(
+    chunk_id: str,
+    document_id: str,
+    chunk_index: int,
+    chunk_text: str,
+    embedding_vector: bytes,
+    chunk_hash: str,
+    metadata: Dict[str, Any]
+) -> bool:
+    """Save a document chunk to the database"""
+    if not db_pool:
+        logger.error("Database connection pool is not initialized")
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                query = """
+                INSERT INTO document_chunks (
+                    chunk_id, document_id, chunk_index, chunk_text,
+                    embedding_vector, chunk_hash, metadata,
+                    created_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                    chunk_text = $4,
+                    embedding_vector = $5,
+                    chunk_hash = $6,
+                    metadata = $7,
+                    updated_at = $9
+                """
+
+                await conn.execute(
+                    query,
+                    chunk_id,
+                    document_id,
+                    chunk_index,
+                    chunk_text,
+                    embedding_vector,
+                    chunk_hash,
+                    json.dumps(metadata),
+                    datetime.utcnow(),
+                    datetime.utcnow()
+                )
+
+                # Update the document's chunk count and processing status
+                await conn.execute("""
+                    UPDATE documents
+                    SET chunk_count = chunk_count + 1,
+                        processing_status = 'completed',
+                        updated_at = NOW()
+                    WHERE document_id = $1
+                """, document_id)
+
+                return True
+    except Exception as e:
+        logger.error(f"Error saving document chunk to database: {str(e)}")
+        return False
+
+async def log_vector_search(query: str, results: List[Dict]) -> bool:
+    """Log a vector search operation in the database"""
+    if not db_pool:
+        logger.error("Database connection pool is not initialized")
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                query = """
+                INSERT INTO vector_search_sessions (
+                    session_id, query_text, search_results, relevant_chunks
+                ) VALUES ($1, $2, $3, $4)
+                """
+
+                await conn.execute(
+                    query,
+                    str(uuid.uuid4()),
+                    query,
+                    json.dumps([{
+                        "chunk_id": r["chunk_id"],
+                        "document_id": r["document_id"],
+                        "score": r["score"],
+                        "metadata": r["metadata"]
+                    } for r in results]),
+                    len(results)
+                )
+
+                return True
+    except Exception as e:
+        logger.error(f"Error logging vector search to database: {str(e)}")
+        return False
+
+async def add_to_processing_queue(
+    document_id: str,
+    storj_url: str,
+    metadata: Dict[str, Any],
+    priority: int = 1
+) -> bool:
+    """Add a document to the processing queue"""
+    if not db_pool:
+        logger.error("Database connection pool is not initialized")
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                query = """
+                INSERT INTO document_processing_queue (
+                    document_id, storj_url, processing_status,
+                    priority, metadata, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                """
+
+                await conn.execute(
+                    query,
+                    document_id,
+                    storj_url,
+                    "queued",
+                    priority,
+                    json.dumps(metadata),
+                    datetime.utcnow()
+                )
+
+                return True
+    except Exception as e:
+        logger.error(f"Error adding document to processing queue: {str(e)}")
+        return False
+
+async def create_batch_job(
+    batch_id: str,
+    total_documents: int,
+    metadata: Dict[str, Any]
+) -> bool:
+    """Create a batch processing job"""
+    if not db_pool:
+        logger.error("Database connection pool is not initialized")
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                query = """
+                INSERT INTO batch_processing_jobs (
+                    batch_id, total_documents, status,
+                    metadata, created_at
+                ) VALUES ($1, $2, $3, $4, $5)
+                """
+
+                await conn.execute(
+                    query,
+                    batch_id,
+                    total_documents,
+                    "started",
+                    json.dumps(metadata),
+                    datetime.utcnow()
+                )
+
+                return True
+    except Exception as e:
+        logger.error(f"Error creating batch job: {str(e)}")
+        return False
+
+async def update_batch_job_status(
+    batch_id: str,
+    status: str,
+    processed: int = 0,
+    failed: int = 0
+) -> bool:
+    """Update the status of a batch processing job"""
+    if not db_pool:
+        logger.error("Database connection pool is not initialized")
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                if status == "completed":
+                    query = """
+                    UPDATE batch_processing_jobs
+                    SET status = $1,
+                        processed_documents = $2,
+                        failed_documents = $3,
+                        completed_at = NOW()
+                    WHERE batch_id = $4
+                    """
+                else:
+                    query = """
+                    UPDATE batch_processing_jobs
+                    SET status = $1,
+                        processed_documents = $2,
+                        failed_documents = $3
+                    WHERE batch_id = $4
+                    """
+
+                await conn.execute(
+                    query,
+                    status,
+                    processed,
+                    failed,
+                    batch_id
+                )
+
+                return True
+    except Exception as e:
+        logger.error(f"Error updating batch job status: {str(e)}")
+        return False
 
 async def save_to_db_async(url, doc_id, analysis, text, request):
     """Non-blocking database save"""
@@ -800,6 +1207,7 @@ async def save_to_db_async(url, doc_id, analysis, text, request):
             "context_id_uuid": request.context_id_uuid or str(uuid.uuid4()),
             "org_id_uuid": request.org_id_uuid
         }
+
         await save_analysis_to_db(url, doc_id, analysis, text, metadata)
     except Exception as e:
         logger.warning(f"Background save failed: {str(e)}")
@@ -823,11 +1231,9 @@ async def process_and_vectorize_document(url: str, content: bytes, document_id: 
 async def process_documents_batch(urls: List[str], batch_size: int = 5):
     """Process documents in batches for Vercel memory limits"""
     results = []
-
     for i in range(0, len(urls), batch_size):
         batch = urls[i:i + batch_size]
         batch_tasks = []
-
         for url in batch:
             task = asyncio.create_task(download_and_process_single_url(url, ""))
             batch_tasks.append(task)
@@ -896,12 +1302,15 @@ async def analyze_policy_text(request: PolicyAnalysisRequest):
     """Analyze policy text"""
     if not request.text:
         raise HTTPException(status_code=400, detail="Text input is required")
+
     api_key = get_api_key(request.api_key)
     if not api_key:
         raise HTTPException(status_code=400, detail="API key is required either in request or as environment variable")
+
     request_id = generate_unique_id()
     document_id = hashlib.md5(request.text.encode()).hexdigest()
     document_cache[document_id] = request.text
+
     prompt = f"""Analyze the following policy document and provide a detailed review:
     Policy Document: {request.text}...
     Sector: {request.sector}
@@ -917,7 +1326,9 @@ async def analyze_policy_text(request: PolicyAnalysisRequest):
     5. Compliance considerations
     Format your response in markdown with clear sections.
     """
+
     analysis_result = direct_api_call_optimized(prompt, api_key)
+
     return JSONResponse(content={
         "analysis": analysis_result,
         "request_id": request_id,
@@ -932,9 +1343,12 @@ async def analyze_policy_file_optimized(request: PolicyAnalysisFileRequest):
         api_key = get_api_key(request.api_key)
         if not api_key:
             raise HTTPException(status_code=400, detail="API key required")
+
         if not request.storj_urls:
             raise HTTPException(status_code=400, detail="No URLs provided")
+
         processed_files = await process_urls_parallel(request.storj_urls, api_key)
+
         for file_result in processed_files:
             if file_result.get("cached"):
                 cached_result = file_result["result"]
@@ -945,22 +1359,29 @@ async def analyze_policy_file_optimized(request: PolicyAnalysisFileRequest):
                     "from_cache": True,
                     "cached_at": str(cached_result["created_at_timestamp"])
                 })
+
         if not processed_files:
             raise HTTPException(status_code=400, detail="No files processed successfully")
+
         all_text = []
         for file_result in processed_files:
             if "text" in file_result:
                 all_text.append(f"=== {file_result['url']} ===\n{file_result['text']}")
+
         combined_text = "\n\n===DOCUMENT SEPARATOR===\n\n".join(all_text)
         document_id = hashlib.md5(combined_text.encode()).hexdigest()
         document_cache[document_id] = combined_text
+
         prompt_context = build_concise_prompt(request)
         request_id = generate_unique_id()
+
         analysis_result = await analyze_large_document_fast(
             combined_text, prompt_context, api_key, request_id
         )
+
         asyncio.create_task(save_to_db_async(request.storj_urls[0], document_id,
                                            analysis_result, combined_text, request))
+
         return JSONResponse(content={
             "analysis": analysis_result,
             "request_id": request_id,
@@ -982,8 +1403,10 @@ async def analyze_policy_file_with_rag(request: PolicyAnalysisFileRequest):
         api_key = get_api_key(request.api_key)
         if not api_key:
             raise HTTPException(status_code=400, detail="API key required")
+
         if not request.storj_urls:
             raise HTTPException(status_code=400, detail="No URLs provided")
+
         processed_documents = []
         for url in request.storj_urls:
             try:
@@ -1002,12 +1425,13 @@ async def analyze_policy_file_with_rag(request: PolicyAnalysisFileRequest):
                 result = await process_and_vectorize_document(url, content, document_id, doc_metadata)
                 if "error" not in result:
                     processed_documents.append(result)
-
             except Exception as e:
                 logger.error(f"Error processing {url}: {str(e)}")
                 continue
+
         if not processed_documents:
             raise HTTPException(status_code=400, detail="No documents processed successfully")
+
         combined_text = "\n\n".join([doc["text"] for doc in processed_documents])
         document_id = hashlib.md5(combined_text.encode()).hexdigest()
 
@@ -1017,6 +1441,7 @@ async def analyze_policy_file_with_rag(request: PolicyAnalysisFileRequest):
         analysis_result = await analyze_large_document_fast(
             combined_text, prompt_context, api_key, request_id
         )
+
         return JSONResponse(content={
             "analysis": analysis_result,
             "request_id": request_id,
@@ -1038,7 +1463,9 @@ async def enhanced_chat_with_document(request: ChatRequest):
             status_code=400,
             detail="API key is required either in request or as environment variable"
         )
+
     session_id = request.session_id or generate_session_id()
+
     if request.system_role:
         system_role = request.system_role
     else:
@@ -1049,6 +1476,7 @@ async def enhanced_chat_with_document(request: ChatRequest):
             request.roles,
             request.use_cases
         )
+
     if request.conversation_context is not None:
         chat_history = {
             "conversation_context": request.conversation_context,
@@ -1067,11 +1495,14 @@ async def enhanced_chat_with_document(request: ChatRequest):
                 "document_id": request.document_id,
                 "updated_at": time.time()
             }
+
     user_message = {
         "role": "user",
         "content": [{"type": "text", "text": request.message}]
     }
+
     chat_history["conversation_context"].append(user_message)
+
     document_context = ""
     if request.document_id:
         if request.document_id in document_cache:
@@ -1081,13 +1512,16 @@ async def enhanced_chat_with_document(request: ChatRequest):
             if db_document:
                 document_context = f"Document Context:\n{db_document[:2000]}...\n\n"
                 document_cache[request.document_id] = db_document
+
     conversation_history = ""
     for msg in chat_history["conversation_context"][-10:]:
         role = msg["role"]
         content = msg["content"][0]["text"] if msg["content"] else ""
         conversation_history += f"{role.capitalize()}: {content}\n"
+
     locations_context = format_locations(request.locations)
     use_cases_context = format_use_cases(request.useCases)
+
     system_context = f"""
     Context:
     - Sector: {system_role.get('sectorReadable', 'Technology')}
@@ -1095,32 +1529,42 @@ async def enhanced_chat_with_document(request: ChatRequest):
     - Jurisdictions: {system_role.get('jurisdictionReadable', '')}
     - Roles: {system_role.get('rolesReadable', 'Consumer')}
     - Use Cases: {system_role.get('useCasesReadable', 'Not specified')}
+
     Locations:
     {locations_context}
+
     Use Cases:
     {use_cases_context}
     """
+
     prompt = f"""{system_context}
 {document_context}
 Previous Conversation:
 {conversation_history}
 Current User Message: {request.message}
+
 Please provide a helpful response based on the context, document (if available), and conversation history.
 Format your response appropriately and maintain consistency with the established context.
 """
+
     ai_response = direct_api_call_optimized(prompt, api_key)
+
     assistant_message = {
         "role": "assistant",
         "content": [{"type": "text", "text": ai_response}]
     }
+
     chat_history["conversation_context"].append(assistant_message)
     chat_history["assistant_response"] = [{"type": "text", "text": ai_response}]
     chat_history["updated_at"] = time.time()
     chat_history["system_role"] = system_role
+
     if request.document_id:
         chat_history["document_id"] = request.document_id
+
     await save_chat_history_to_db(session_id, chat_history)
     chat_history_cache[session_id] = chat_history
+
     return JSONResponse(content={
         "response": ai_response,
         "session_id": session_id,
@@ -1135,9 +1579,10 @@ async def rag_enhanced_chat(request: ChatRequest):
     api_key = get_api_key(request.api_key)
     if not api_key:
         raise HTTPException(status_code=400, detail="API key required")
-    session_id = request.session_id or generate_session_id()
 
+    session_id = request.session_id or generate_session_id()
     chat_history = await get_chat_history_from_db(session_id)
+
     if not chat_history:
         chat_history = {
             "conversation_context": [],
@@ -1181,6 +1626,7 @@ async def rag_enhanced_chat(request: ChatRequest):
 Previous Conversation:
 {conversation_history}
 Current User Message: {request.message}
+
 Based on the relevant document excerpts and conversation history, provide a helpful and accurate response.
 If the document excerpts don't contain relevant information, use your general knowledge but mention that.
 """
@@ -1193,6 +1639,7 @@ If the document excerpts don't contain relevant information, use your general kn
     chat_history["conversation_context"].extend([user_message, assistant_message])
     chat_history["assistant_response"] = [{"type": "text", "text": ai_response}]
     chat_history["updated_at"] = time.time()
+
     await save_chat_history_to_db(session_id, chat_history)
 
     return JSONResponse(content={
@@ -1215,6 +1662,7 @@ async def list_documents():
             "content_preview": content[:200] + "..." if len(content) > 200 else content,
             "content_length": len(content)
         })
+
     return JSONResponse(content={
         "documents": documents,
         "total_count": len(documents)
@@ -1225,6 +1673,7 @@ async def get_document(document_id: str):
     """Get a specific document by ID"""
     if document_id not in document_cache:
         raise HTTPException(status_code=404, detail="Document not found")
+
     content = document_cache[document_id]
     return JSONResponse(content={
         "document_id": document_id,
@@ -1237,6 +1686,7 @@ async def delete_document(document_id: str):
     """Delete a cached document"""
     if document_id not in document_cache:
         raise HTTPException(status_code=404, detail="Document not found")
+
     del document_cache[document_id]
     return JSONResponse(content={
         "message": f"Document {document_id} deleted successfully"
@@ -1247,8 +1697,10 @@ async def get_analysis_status(request_id: str):
     """Get real analysis progress"""
     if request_id not in analysis_progress:
         return {"status": "not_found", "request_id": request_id}
+
     progress = analysis_progress[request_id]
     completion_percentage = int((progress["completed_chunks"] / progress["total_chunks"]) * 100)
+
     return {
         "status": progress.get("status", "in_progress"),
         "request_id": request_id,
@@ -1261,7 +1713,6 @@ async def get_analysis_status(request_id: str):
 async def get_vector_store_stats():
     """Get vector store statistics"""
     await vector_store.initialize()
-
     return JSONResponse(content={
         "total_chunks": vector_store.index.ntotal if vector_store.index else 0,
         "unique_documents": len(set(chunk['document_id'] for chunk in vector_store.document_chunks.values())),
@@ -1273,7 +1724,6 @@ async def get_vector_store_stats():
 async def search_vector_store(query: str, k: int = 10, threshold: float = 0.6):
     """Direct vector store search endpoint"""
     results = await vector_store.similarity_search(query, k=k, score_threshold=threshold)
-
     return JSONResponse(content={
         "query": query,
         "results": results,
